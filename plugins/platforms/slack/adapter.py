@@ -1156,9 +1156,13 @@ class SlackAdapter(BasePlatformAdapter):
                 closer = getattr(client, method_name, None)
                 if not callable(closer):
                     continue
-                result = closer()
-                if inspect.isawaitable(result):
-                    await result
+                try:
+                    result = closer()
+                    if inspect.isawaitable(result):
+                        await result
+                except (Exception, asyncio.CancelledError) as exc:  # pragma: no cover - defensive logging
+                    logger.warning(
+                        "[Slack] Error while closing workspace client: %s", exc, exc_info=True)
                 break
 
     @staticmethod
@@ -1272,12 +1276,16 @@ class SlackAdapter(BasePlatformAdapter):
         handler, task = self._handler, self._socket_mode_task
         self._handler = self._socket_mode_task = None
         client = getattr(handler, "client", None)
-        await _cancel_socket_tasks(
-            [task] + [getattr(client, attr, None) for attr in _SOCKET_CLIENT_TASK_ATTRS])
+        try:
+            await _cancel_socket_tasks(
+                [task] + [getattr(client, attr, None) for attr in _SOCKET_CLIENT_TASK_ATTRS])
+        except (Exception, asyncio.CancelledError) as e:  # pragma: no cover - defensive logging
+            logger.warning(
+                "[Slack] Error while cancelling Socket Mode tasks: %s", e, exc_info=True)
         if handler is not None:
             try:
                 await handler.close_async()
-            except Exception as e:  # pragma: no cover - defensive logging
+            except (Exception, asyncio.CancelledError) as e:  # pragma: no cover - defensive logging
                 logger.warning(
                     "[Slack] Error while closing Socket Mode handler: %s", e, exc_info=True)
 
@@ -1905,26 +1913,76 @@ class SlackAdapter(BasePlatformAdapter):
                 parent_chat_id, exc)
         return None
 
-    async def disconnect(self) -> None:
-        """Disconnect from Slack."""
-        self._running = False
-        # Seal dangling native streams so no live-typing indicator survives a restart.
-        for key, stream in list(self._active_streams.items()):
-            await self._seal_stream(key, stream)
+    def _clear_disconnect_state(self) -> None:
+        """Clear transient adapter state on disconnect."""
         self._active_streams.clear()
-        # A watchdog that lost the cancel race must not block cleanup/lock release.
-        await self._cancel_socket_watchdog("[Slack] Watchdog task raised during disconnect")
-        # Finalize native streams while workspace clients are still live —
-        # shutdown safety net for cancellation/reconnect races.
-        for key, stream in list(self._native_task_card_streams.items()):
-            await self._stop_native_task_card_stream(key, stream)
-        await self._stop_socket_mode_handler()
-        await self._close_workspace_clients()
+        self._native_task_card_streams.clear()
         self._app = self._app_token = self._proxy_url = self._bot_user_id = None
         self._team_clients, self._team_bot_user_ids = {}, {}
         self._channel_team, self._dm_conversation_cache = {}, {}
-        self._release_platform_lock()
-        logger.info("[Slack] Disconnected")
+
+    def _release_platform_lock_once(self) -> None:
+        """Release the platform lock at most once per disconnect cycle and clear lock identity."""
+        if getattr(self, "_disconnect_lock_released", False):
+            return
+        self._disconnect_lock_released = True
+        try:
+            self._release_platform_lock()
+        except Exception as exc:  # pragma: no cover - defensive logging
+            logger.warning("[Slack] Error releasing platform lock: %s", exc, exc_info=True)
+        finally:
+            self._platform_lock_identity = None
+
+    async def disconnect(self) -> None:
+        """Disconnect from Slack."""
+        self._running = False
+        self._disconnect_lock_released = False
+        try:
+            # Seal dangling native streams so no live-typing indicator survives a restart.
+            for key, stream in list(self._active_streams.items()):
+                try:
+                    await self._seal_stream(key, stream)
+                except (Exception, asyncio.CancelledError) as exc:
+                    logger.warning(
+                        "[Slack] Error sealing stream %s during disconnect: %s",
+                        key, exc, exc_info=True)
+                finally:
+                    self._active_streams.pop(key, None)
+            self._active_streams.clear()
+            # A watchdog that lost the cancel race must not block cleanup/lock release.
+            try:
+                await self._cancel_socket_watchdog("[Slack] Watchdog task raised during disconnect")
+            except (Exception, asyncio.CancelledError) as exc:
+                logger.warning(
+                    "[Slack] Error cancelling watchdog during disconnect: %s", exc, exc_info=True)
+            # Finalize native streams while workspace clients are still live —
+            # shutdown safety net for cancellation/reconnect races.
+            for key, stream in list(self._native_task_card_streams.items()):
+                try:
+                    await self._stop_native_task_card_stream(key, stream)
+                except (Exception, asyncio.CancelledError) as exc:
+                    logger.warning(
+                        "[Slack] Error stopping task-card stream %s during disconnect: %s",
+                        key, exc, exc_info=True)
+                finally:
+                    self._native_task_card_streams.pop(key, None)
+            self._native_task_card_streams.clear()
+            try:
+                await self._stop_socket_mode_handler()
+            except (Exception, asyncio.CancelledError) as exc:
+                logger.warning(
+                    "[Slack] Error stopping Socket Mode handler during disconnect: %s",
+                    exc, exc_info=True)
+            try:
+                await self._close_workspace_clients()
+            except (Exception, asyncio.CancelledError) as exc:
+                logger.warning(
+                    "[Slack] Error closing workspace clients during disconnect: %s",
+                    exc, exc_info=True)
+        finally:
+            self._clear_disconnect_state()
+            self._release_platform_lock_once()
+            logger.info("[Slack] Disconnected")
 
     @staticmethod
     def _metadata_team_id(metadata: Optional[dict[str, Any]]) -> str:
@@ -2166,19 +2224,19 @@ class SlackAdapter(BasePlatformAdapter):
 
     async def _stop_native_task_card_stream(
         self, key: tuple[str, str, str], stream: _NativeTaskCardStream) -> None:
-        async with stream.lock:
-            if stream.stopped:
-                return
-            stream.stopped = True
-            try:
+        try:
+            async with stream.lock:
+                if stream.stopped:
+                    return
+                stream.stopped = True
                 if self._app and stream.stream_ts:
                     await self._get_client(stream.channel, team_id=stream.team_id).api_call(
                         "chat.stopStream", json={"channel": stream.channel, "ts": stream.stream_ts})
-            except Exception as exc:  # pragma: no cover - defensive logging
-                logger.debug("[Slack] Native task-card stopStream failed: %s", exc)
-            finally:
-                if self._native_task_card_streams.get(key) is stream:
-                    self._native_task_card_streams.pop(key, None)
+        except (Exception, asyncio.CancelledError) as exc:  # pragma: no cover - defensive logging
+            logger.debug("[Slack] Native task-card stopStream failed: %s", exc)
+        finally:
+            if self._native_task_card_streams.get(key) is stream:
+                self._native_task_card_streams.pop(key, None)
 
     async def stop_native_task_card_progress(
         self, chat_id: str, *, reply_to: Optional[str] = None,
@@ -2634,14 +2692,16 @@ class SlackAdapter(BasePlatformAdapter):
         """Best-effort chat.stopStream for an open stream. ``delta`` is the exact unsent tail of
         the final content (the API is append-only: ``stopStream.markdown_text`` APPENDS). Returns
         True on success."""
-        team_id, chat_id, _ = key
+        team_id, chat_id = (
+            (key[0], key[1]) if isinstance(key, tuple) and len(key) >= 2 else ("", str(key))
+        )
         try:
             kwargs: dict[str, Any] = {"channel": chat_id, "ts": stream["ts"]}
             if delta and delta.strip():
                 kwargs["markdown_text"] = delta
             await self._get_client(chat_id, team_id=team_id or None).chat_stopStream(**kwargs)
             return True
-        except Exception as e:  # pragma: no cover - defensive
+        except (Exception, asyncio.CancelledError) as e:  # pragma: no cover - defensive
             logger.debug(
                 "[Slack] chat.stopStream failed for %s/%s: %s", chat_id, stream.get("ts"), e)
             return False

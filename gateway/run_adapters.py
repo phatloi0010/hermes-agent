@@ -91,21 +91,49 @@ class GatewayAdapterLifecycleMixin:
             return True
         task = asyncio.ensure_future(awaitable)
         if not await self._wait_or_detach(task, timeout):
+            if not task.done():
+                await self._wait_or_detach(task, min(timeout, 0.05))
             return False
         await task
         return True
+
+    @staticmethod
+    def _fallback_release_adapter_lock(adapter) -> None:
+        """Best-effort fallback when adapter.disconnect() raises or times out before releasing its lock."""
+        identity = getattr(adapter, "_platform_lock_identity", None)
+        if not isinstance(identity, str) or not identity:
+            return
+        clear_state = getattr(adapter, "_clear_disconnect_state", None)
+        if callable(clear_state):
+            with _log_suppressed(logging.DEBUG, "Fallback adapter state clear failed: %s"):
+                clear_state()
+        release_once = getattr(adapter, "_release_platform_lock_once", None)
+        if callable(release_once):
+            with _log_suppressed(logging.DEBUG, "Fallback platform lock release failed: %s"):
+                release_once()
+            return
+        release = getattr(adapter, "_release_platform_lock", None)
+        if callable(release):
+            with _log_suppressed(logging.DEBUG, "Fallback platform lock release failed: %s"):
+                try:
+                    release()
+                finally:
+                    adapter._platform_lock_identity = None
 
     async def _safe_adapter_disconnect(self, adapter, platform) -> None:
         """Call adapter.disconnect() defensively (bounded, never raises, tolerates partial-init state):
         after a failed connect() partial resources (ClientSession, poll tasks, subprocesses) leak."""
         timeout = self._adapter_disconnect_timeout_secs()
         label = platform.value if platform is not None else "adapter"
-        with _log_suppressed(logging.DEBUG, "Defensive %s disconnect after failed connect raised: %s", label):
-            if not await self._await_adapter_cleanup_with_timeout(adapter.disconnect(), timeout):
-                logger.warning(
-                    "Timed out after %.1fs while disconnecting %s adapter; continuing shutdown",
-                    timeout, label,
-                )
+        try:
+            with _log_suppressed(logging.DEBUG, "Defensive %s disconnect after failed connect raised: %s", label):
+                if not await self._await_adapter_cleanup_with_timeout(adapter.disconnect(), timeout):
+                    logger.warning(
+                        "Timed out after %.1fs while disconnecting %s adapter; continuing shutdown",
+                        timeout, label,
+                    )
+        finally:
+            self._fallback_release_adapter_lock(adapter)
 
     async def _bounded_adapter_teardown(self, adapter, platform, *, profile: Optional[str] = None) -> None:
         """Tear down one adapter on the shutdown path with bounded awaits (never raises). Unbounded,
@@ -126,19 +154,22 @@ class GatewayAdapterLifecycleMixin:
                 )
         except Exception as e:
             logger.debug("✗ %s background-task cancel error%s: %s", platform.value, suffix, e)
-        with _log_suppressed(
-            logging.ERROR, "✗ %s disconnect error after %.2fs%s: %s",
-            platform.value, time.monotonic() - started_at, suffix,
-        ):
-            if await self._await_adapter_cleanup_with_timeout(adapter.disconnect(), timeout):
-                logger.info(
-                    "✓ %s disconnected (%.2fs)%s", platform.value, time.monotonic() - started_at, suffix,
-                )
-            else:
-                logger.warning(
-                    "✗ %s disconnect timed out after %.1fs - forcing continue%s",
-                    platform.value, timeout, suffix,
-                )
+        try:
+            with _log_suppressed(
+                logging.ERROR, "✗ %s disconnect error after %.2fs%s: %s",
+                platform.value, time.monotonic() - started_at, suffix,
+            ):
+                if await self._await_adapter_cleanup_with_timeout(adapter.disconnect(), timeout):
+                    logger.info(
+                        "✓ %s disconnected (%.2fs)%s", platform.value, time.monotonic() - started_at, suffix,
+                    )
+                else:
+                    logger.warning(
+                        "✗ %s disconnect timed out after %.1fs - forcing continue%s",
+                        platform.value, timeout, suffix,
+                    )
+        finally:
+            self._fallback_release_adapter_lock(adapter)
 
     @staticmethod
     def _env_timeout_override(name: str) -> Optional[float]:

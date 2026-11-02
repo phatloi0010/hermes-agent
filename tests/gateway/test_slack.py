@@ -612,6 +612,96 @@ class TestSlackConnectCleanup:
         assert adapter._proxy_url is None
         mock_release.assert_called_once_with("slack-app-token", "xapp-fake")
 
+    @pytest.mark.asyncio
+    async def test_disconnect_isolates_failing_workspace_client_and_releases_lock(self, caplog):
+        """Regression for #147845: a raising workspace client close() must not skip
+        remaining clients, state reset, or platform-lock release."""
+        config = PlatformConfig(enabled=True, token="xoxb-fake")
+        adapter = SlackAdapter(config)
+
+        primary_client = MagicMock()
+        primary_client.close = MagicMock(side_effect=RuntimeError("workspace client close failed"))
+        team_client = MagicMock()
+        team_client.close = AsyncMock(return_value=None)
+
+        adapter._running = True
+        adapter._app = MagicMock(client=primary_client)
+        adapter._team_clients = {"T_FAKE": team_client}
+        adapter._team_bot_user_ids = {"T_FAKE": "U_BOT"}
+        adapter._channel_team = {"C_FAKE": "T_FAKE"}
+        adapter._dm_conversation_cache = {"U_USER": "D_DM"}
+        adapter._platform_lock_scope = "slack-app-token"
+        adapter._platform_lock_identity = "xapp-fake"
+
+        with (
+            patch("gateway.status_scoped_locks.release_scoped_lock") as mock_release,
+            caplog.at_level("WARNING"),
+        ):
+            await adapter.disconnect()
+
+        primary_client.close.assert_called_once_with()
+        team_client.close.assert_awaited_once_with()
+        assert "workspace client close failed" in caplog.text
+        assert adapter._app is None
+        assert adapter._team_clients == {}
+        assert adapter._team_bot_user_ids == {}
+        assert adapter._channel_team == {}
+        assert adapter._dm_conversation_cache == {}
+        assert adapter._platform_lock_identity is None
+        mock_release.assert_called_once_with("slack-app-token", "xapp-fake")
+
+    @pytest.mark.asyncio
+    async def test_disconnect_continues_all_steps_and_releases_lock_when_each_step_raises(self):
+        """Regression for #147845: every cleanup step in disconnect() is isolated so an
+        exception in an early step does not skip later cleanup or lock release."""
+        config = PlatformConfig(enabled=True, token="xoxb-fake")
+        adapter = SlackAdapter(config)
+
+        adapter._running = True
+        adapter._active_streams = {("T1", "C1", "1.0"): {"ts": "1.0", "sent": "hi"}}
+        adapter._native_task_card_streams = {("T1", "C1", "1.0"): MagicMock()}
+        adapter._app = MagicMock()
+        adapter._team_clients = {"T1": MagicMock()}
+        adapter._platform_lock_scope = "slack-app-token"
+        adapter._platform_lock_identity = "xapp-fake"
+
+        steps_called: list[str] = []
+
+        def _fail_step(name: str):
+            steps_called.append(name)
+            raise RuntimeError(f"{name} boom")
+
+        adapter._seal_stream = AsyncMock(side_effect=lambda *_a, **_kw: _fail_step("seal_stream"))
+        adapter._cancel_socket_watchdog = AsyncMock(
+            side_effect=lambda *_a, **_kw: _fail_step("cancel_watchdog")
+        )
+        adapter._stop_native_task_card_stream = AsyncMock(
+            side_effect=lambda *_a, **_kw: _fail_step("stop_task_card")
+        )
+        adapter._stop_socket_mode_handler = AsyncMock(
+            side_effect=lambda *_a, **_kw: _fail_step("stop_socket_mode")
+        )
+        adapter._close_workspace_clients = AsyncMock(
+            side_effect=lambda *_a, **_kw: _fail_step("close_clients")
+        )
+
+        with patch("gateway.status_scoped_locks.release_scoped_lock") as mock_release:
+            await adapter.disconnect()
+
+        assert steps_called == [
+            "seal_stream",
+            "cancel_watchdog",
+            "stop_task_card",
+            "stop_socket_mode",
+            "close_clients",
+        ]
+        assert adapter._active_streams == {}
+        assert adapter._native_task_card_streams == {}
+        assert adapter._app is None
+        assert adapter._team_clients == {}
+        assert adapter._platform_lock_identity is None
+        mock_release.assert_called_once_with("slack-app-token", "xapp-fake")
+
 
 # ---------------------------------------------------------------------------
 # TestSlackSocketWatchdog

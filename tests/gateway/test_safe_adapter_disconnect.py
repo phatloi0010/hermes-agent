@@ -86,3 +86,71 @@ async def test_safe_disconnect_detaches_cancellation_swallowing_disconnect(
         release.set()
         await asyncio.wait({operation}, timeout=0.2)
         await asyncio.wait_for(finished.wait(), timeout=0.2)
+
+
+@pytest.mark.asyncio
+async def test_safe_disconnect_slack_releases_lock_when_workspace_client_close_raises(
+    bare_runner, monkeypatch
+):
+    """Regression for #147845: RaisingClient.close() during Slack disconnect must still
+    release the platform lock and clear transient state."""
+    from gateway.config import PlatformConfig
+    from plugins.platforms.slack.adapter import SlackAdapter
+
+    monkeypatch.setenv("HERMES_GATEWAY_ADAPTER_DISCONNECT_TIMEOUT", "0.05")
+    released: list[str] = []
+
+    class RaisingClient:
+        def close(self):
+            raise RuntimeError("workspace client close failed")
+
+    adapter = SlackAdapter(PlatformConfig(enabled=True, token="xoxb-fake"))
+    adapter._app = MagicMock(client=RaisingClient())
+    adapter._platform_lock_scope = "slack-app-token"
+    adapter._platform_lock_identity = "xapp-fake"
+    adapter._release_platform_lock = lambda: released.append("released")
+
+    await bare_runner._safe_adapter_disconnect(adapter, Platform.SLACK)
+
+    assert released == ["released"]
+    assert adapter._platform_lock_identity is None
+    assert adapter._app is None
+
+
+@pytest.mark.asyncio
+async def test_safe_disconnect_slack_releases_lock_and_finishes_cleanup_when_seal_stream_hangs(
+    bare_runner, monkeypatch
+):
+    """Regression for #147845: when _seal_stream hangs waiting on chat.stopStream and bounded
+    teardown cancels it, remaining cleanup and platform-lock release must still run."""
+    from gateway.config import PlatformConfig
+    from plugins.platforms.slack.adapter import SlackAdapter
+
+    monkeypatch.setenv("HERMES_GATEWAY_ADAPTER_DISCONNECT_TIMEOUT", "0.05")
+    released: list[str] = []
+    closed_clients: list[str] = []
+
+    class HangingStreamClient:
+        async def chat_stopStream(self, **kwargs):
+            await asyncio.Event().wait()
+
+    class TeamClient:
+        async def close(self):
+            closed_clients.append("team")
+
+    adapter = SlackAdapter(PlatformConfig(enabled=True, token="xoxb-fake"))
+    adapter._active_streams = {"stream-1": {"ts": "1.0", "sent": ""}}
+    adapter._team_clients = {"T1": TeamClient()}
+    adapter._get_client = lambda *args, **kwargs: HangingStreamClient()
+    adapter._platform_lock_scope = "slack-app-token"
+    adapter._platform_lock_identity = "xapp-fake"
+    adapter._release_platform_lock = lambda: released.append("released")
+
+    await bare_runner._safe_adapter_disconnect(adapter, Platform.SLACK)
+
+    assert released == ["released"]
+    assert closed_clients == ["team"]
+    assert len(adapter._active_streams) == 0
+    assert adapter._team_clients == {}
+    assert adapter._platform_lock_identity is None
+
